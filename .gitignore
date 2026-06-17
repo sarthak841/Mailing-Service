@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# Runtime files
+sent-log.json
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

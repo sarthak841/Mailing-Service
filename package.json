@@ -1,0 +1,19 @@
+{
+  "name": "mailing-service",
+  "version": "1.0.0",
+  "description": "",
+  "main": "massMailer.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
+    "dotenv": "^17.4.2",
+    "nodemailer": "^9.0.1",
+    "qrcode": "^1.5.4"
+  }
+}
