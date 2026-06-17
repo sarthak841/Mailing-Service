@@ -68,7 +68,7 @@ function createSupabaseClient() {
 async function fetchStudents(supabase) {
   const { data, error } = await supabase
     .from("students")
-    .select("id, name, email, admission_number, password_hash")
+    .select("id, name, email, admission_number, password_hash, day, slot, room")
     .eq("is_active", true)
     .order("id", { ascending: true });
 
@@ -106,10 +106,18 @@ function generatePassword(length = 10) {
 async function loadSentLog() {
   try {
     const raw = await fs.readFile(SENT_LOG_PATH, "utf8");
-    return new Set(JSON.parse(raw));
+    return new Map(
+      JSON.parse(raw).map((entry) => {
+        if (typeof entry === "object" && entry !== null) {
+          return [entry.id, entry];
+        }
+
+        return [entry, { id: entry }];
+      })
+    );
   } catch (error) {
     if (error.code === "ENOENT") {
-      return new Set();
+      return new Map();
     }
 
     throw error;
@@ -129,31 +137,47 @@ function createTransport() {
 }
 
 async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+
   for (let index = 0; index < students.length; index += CONFIG.batchSize) {
     const batch = students.slice(index, index + CONFIG.batchSize);
 
     for (const student of batch) {
       if (sentLog.has(student.id)) {
+        skipped += 1;
         console.log(`Skipping ${student.email}; already sent.`);
         continue;
       }
 
-      await updateStudentPassword(supabase, student);
+      try {
+        const qrBuffer = await generateQRBuffer(student);
+        const html = generateEmailHTML(student);
 
-      const qrBuffer = await generateQRBuffer(student);
-      const html = generateEmailHTML(student);
+        await sendEmailWithRetry({
+          transporter,
+          student,
+          html,
+          qrBuffer,
+        });
 
-      await sendEmailWithRetry({
-        transporter,
-        student,
-        html,
-        qrBuffer,
-      });
+        await updateStudentPassword(supabase, student);
 
-      sentLog.add(student.id);
-      await saveSentLog(sentLog);
+        sentLog.set(student.id, {
+          id: student.id,
+          name: student.name,
+          email: student.email,
+          sent_at: new Date().toISOString(),
+        });
+        await saveSentLog(sentLog);
 
-      console.log(`Sent login email to ${student.email}`);
+        sent += 1;
+        console.log(`Sent login email to ${student.email}`);
+      } catch (error) {
+        failed += 1;
+        console.error(`Failed for ${student.email}: ${error.message}`);
+      }
     }
 
     const hasMoreBatches = index + CONFIG.batchSize < students.length;
@@ -161,6 +185,12 @@ async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
       await delay(CONFIG.batchDelayMs);
     }
   }
+
+  console.log("Email summary");
+  console.log(`Sent: ${sent}`);
+  console.log(`Failed: ${failed}`);
+  console.log(`Skipped: ${skipped}`);
+  console.log(`Total processed: ${sent + failed + skipped}`);
 }
 
 async function generateQRBuffer(student) {
@@ -188,6 +218,18 @@ function generateEmailHTML(student) {
         <tr>
           <td><strong>Password</strong></td>
           <td>${escapeHTML(student.plainPassword)}</td>
+        </tr>
+        <tr>
+          <td><strong>Quiz Day</strong></td>
+          <td>${escapeHTML(student.day)}</td>
+        </tr>
+        <tr>
+          <td><strong>Quiz Slot</strong></td>
+          <td>${escapeHTML(student.slot)}</td>
+        </tr>
+        <tr>
+          <td><strong>Quiz Room</strong></td>
+          <td>${escapeHTML(student.room)}</td>
         </tr>
       </table>
       <p>You can log in here: <a href="${process.env.PORTAL_URL}">${process.env.PORTAL_URL}</a></p>
@@ -247,8 +289,8 @@ async function updateStudentPassword(supabase, student) {
 }
 
 async function saveSentLog(sentLog) {
-  const sentIds = [...sentLog];
-  await fs.writeFile(SENT_LOG_PATH, JSON.stringify(sentIds, null, 2));
+  const sentEntries = [...sentLog.values()];
+  await fs.writeFile(SENT_LOG_PATH, JSON.stringify(sentEntries, null, 2));
 }
 
 function delay(ms) {
