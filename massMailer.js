@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs/promises");
 const path = require("path");
+const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const QRCode = require("qrcode");
 const bcrypt = require("bcryptjs");
@@ -43,6 +44,7 @@ function validateEnvironment() {
     "SMTP_PASS",
     "MAIL_FROM",
     "PORTAL_URL",
+    "SCANNER_URL",
   ];
 
   const missing = required.filter((key) => !process.env[key]);
@@ -68,7 +70,7 @@ function createSupabaseClient() {
 async function fetchStudents(supabase) {
   const { data, error } = await supabase
     .from("students")
-    .select("id, name, email, admission_number, password_hash, day, slot, room")
+    .select("id, name, branch, email, roll_number, password_hash, day, slot, room, qr_token")
     .eq("is_active", true)
     .order("id", { ascending: true });
 
@@ -145,38 +147,49 @@ async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
     const batch = students.slice(index, index + CONFIG.batchSize);
 
     for (const student of batch) {
-      if (sentLog.has(student.id)) {
+      const logEntry = sentLog.get(student.id);
+
+      if (logEntry?.status === "Yes") {
         skipped += 1;
         console.log(`Skipping ${student.email}; already sent.`);
         continue;
       }
 
       try {
-        const qrBuffer = await generateQRBuffer(student);
-        const html = generateEmailHTML(student);
+              const studentWithQrToken = await ensureStudentQrToken(supabase, student);
+              const qrbuffer = await generateQRBuffer(studentWithQrToken);
+              const html = generateEmailHTML(studentWithQrToken);
 
-        await sendEmailWithRetry({
-          transporter,
-          student,
-          html,
-          qrBuffer,
-        });
+          await sendEmailWithRetry({
+            transporter,
+            student: studentWithQrToken,
+            html,
+            qrbuffer,
+          });
 
-        await updateStudentPassword(supabase, student);
+        await updateStudentPassword(supabase, studentWithQrToken);
 
-        sentLog.set(student.id, {
-          id: student.id,
-          name: student.name,
-          email: student.email,
-          sent_at: new Date().toISOString(),
+        sentLog.set(studentWithQrToken.id, {
+          id: studentWithQrToken.id,
+          name: studentWithQrToken.name,
+          email: studentWithQrToken.email,
+          status: "Yes",
         });
         await saveSentLog(sentLog);
 
         sent += 1;
-        console.log(`Sent login email to ${student.email}`);
+        console.log(`Sent login email to ${studentWithQrToken.email}`);
       } catch (error) {
         failed += 1;
         console.error(`Failed for ${student.email}: ${error.message}`);
+        sentLog.set(student.id, {
+        id: student.id,
+        name: student.name,
+        email: student.email,
+        status: "No",
+      });
+
+await saveSentLog(sentLog);
       }
     }
 
@@ -194,74 +207,452 @@ async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
 }
 
 async function generateQRBuffer(student) {
-  const loginUrl = new URL(process.env.PORTAL_URL);
-  loginUrl.searchParams.set("admission_number", student.admission_number);
+  const scannerUrl = new URL(process.env.SCANNER_URL);
+  scannerUrl.searchParams.set("qr_token", student.qr_token);
 
-  return QRCode.toBuffer(loginUrl.toString(), {
-    type: "png",
+  return QRCode.toBuffer(scannerUrl.toString(), {
     margin: 2,
     width: 240,
   });
 }
 
-function generateEmailHTML(student) {
+function generateEmailHTML(student, qrDataUrl) {
+
+  const qrSection = `
+  <img
+    src="cid:student-qr"
+    alt="QR Code"
+    style="
+      display:block;
+      width:100%;
+      max-width:200px;
+      height:auto;
+      margin:0 auto;
+      background:#ffffff;
+      padding:10px;
+      border-radius:12px;
+      box-sizing:border-box;
+    "
+  />
+`;
+
   return `
-    <div style="font-family: Arial, sans-serif; color: #1f2937; line-height: 1.5;">
-      <h2>Your student portal login</h2>
-      <p>Hello ${escapeHTML(student.name)},</p>
-      <p>Your login credentials are ready.</p>
-      <table cellpadding="6" cellspacing="0" style="border-collapse: collapse;">
-        <tr>
-          <td><strong>Admission Number</strong></td>
-          <td>${escapeHTML(student.admission_number)}</td>
-        </tr>
-        <tr>
-          <td><strong>Password</strong></td>
-          <td>${escapeHTML(student.plainPassword)}</td>
-        </tr>
-        <tr>
-          <td><strong>Quiz Day</strong></td>
-          <td>${escapeHTML(student.day)}</td>
-        </tr>
-        <tr>
-          <td><strong>Quiz Slot</strong></td>
-          <td>${escapeHTML(student.slot)}</td>
-        </tr>
-        <tr>
-          <td><strong>Quiz Room</strong></td>
-          <td>${escapeHTML(student.room)}</td>
-        </tr>
-      </table>
-      <p>You can log in here: <a href="${process.env.PORTAL_URL}">${process.env.PORTAL_URL}</a></p>
-      <p>The QR code attached to this email also opens your login page.</p>
-      <p>Please change your password after your first login.</p>
+<div style="
+font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
+width:100%;
+max-width:700px;
+margin:0 auto;
+background:#0F1924;
+color:#f5f6fa;
+border-radius:24px;
+overflow:hidden;
+box-sizing:border-box;
+">
+
+  <div style="
+  background:#173a7a;
+  background-image:linear-gradient(135deg,#0d2650 0%,#173a7a 100%);
+  padding:35px 25px;
+  text-align:center;
+  ">
+
+    <img
+      src="https://res.cloudinary.com/dljpfochn/image/upload/v1745520987/mlsclogo_wbhck3.png"
+      alt="MLSC Logo"
+      height="95"
+      style="display:block;margin:0 auto 15px auto;border:0;"
+    >
+
+    <h1 style="
+    margin:0;
+    font-size:32px;
+    color:#ffffff;
+    font-weight:700;
+    ">
+      Quiz Slot Assigned
+    </h1>
+
+    <p style="
+    margin:10px 0 0 0;
+    color:#b9d3ff;
+    font-size:15px;
+    ">
+      Microsoft Learn Student Chapter • TIET
+    </p>
+
+  </div>
+
+  <div style="padding:30px;">
+
+    <p style="
+    font-size:16px;
+    line-height:1.7;
+    color:#ffffff;
+    margin-top:0;
+    ">
+      Dear <b>${student.name}</b>,
+    </p>
+
+    <p style="
+    font-size:15px;
+    line-height:1.7;
+    color:#d6e4ff;
+    ">
+      Congratulations! Your recruitment quiz slot for the
+      <b>Microsoft Learn Student Chapter (MLSC)</b>
+      has been scheduled. Please review the details below and ensure that you are available during your assigned slot.
+    </p>
+
+    <table
+      width="100%"
+      cellpadding="0"
+      cellspacing="0"
+      border="0"
+      style="
+      margin-top:25px;
+      background:#152434;
+      border:1px solid #29466b;
+      border-radius:20px;
+      "
+    >
+      <tr>
+        <td style="padding:24px;">
+
+          <h3 style="
+          margin:0 0 18px 0;
+          color:#90caf9;
+          font-size:20px;
+          font-weight:600;
+          ">
+            👤 Registration Details
+          </h3>
+
+          <table
+            width="100%"
+            cellpadding="0"
+            cellspacing="0"
+            border="0"
+            style="color:#ffffff;"
+          >
+
+            <tr>
+              <td style="
+              padding:10px 0;
+              color:#90caf9;
+              width:180px;
+              font-weight:600;
+              vertical-align:top;
+              ">
+                Student Name
+              </td>
+
+              <td style="
+              padding:10px 0;
+              color:#ffffff;
+              ">
+                ${student.name}
+              </td>
+            </tr>
+
+            <tr>
+              <td style="
+              padding:12px 0;
+              color:#90caf9;
+              ">
+                Roll Number
+              </td>
+
+              <td style="
+              padding:10px 0;
+              color:#ffffff;
+              ">
+                ${student.roll_number}
+              </td>
+            </tr>
+
+            <tr>
+              <td style="
+              padding:12px 0;
+              color:#90caf9;
+              ">
+                Branch
+              </td>
+
+              <td style="
+              padding:10px 0;
+              color:#ffffff;
+              ">
+                ${student.branch}
+              </td>
+            </tr>
+
+            <tr>
+              <td style="
+              padding:12px 0;
+              color:#90caf9;
+              ">
+                Access Password
+              </td>
+
+              <td style="padding:12px 0;">
+                <span style="
+              font-family:monospace;
+              font-weight:600;
+              font-size:15px;
+              color:#ff8d8d;
+              letter-spacing:0.5px;
+              text-transform:none;
+              ">
+                ${student.plainPassword}
+              </span>
+              </td>
+            </tr>
+
+          </table>
+
+        </td>
+      </tr>
+    </table>
+
+    <table
+      width="100%"
+      cellpadding="0"
+      cellspacing="0"
+      border="0"
+      style="
+      margin-top:25px;
+      background:#12263f;
+      border:1px solid #204b7d;
+      border-radius:20px;
+      "
+    >
+      <tr>
+        <td style="padding:24px;">
+
+          <h3 style="
+          margin:0 0 18px 0;
+          color:#4fc3f7;
+          font-size:20px;
+          font-weight:600;
+          ">
+            📅 Exam Schedule
+          </h3>
+
+          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#17335f;border-radius:16px;margin-bottom:12px;">
+            <tr>
+              <td style="padding:16px;">
+                <div style="
+                color:#90caf9;
+                font-size:11px;
+                letter-spacing:1px;
+                font-weight:600;
+                ">
+                DAY
+                </div>
+
+                <div style="
+                color:#ffffff;
+                font-size:16px;
+                font-weight:500;
+                margin-top:6px;
+                ">
+                  Day ${student.day}
+                </div>
+              </td>
+            </tr>
+          </table>
+
+          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#17335f;border-radius:16px;margin-bottom:12px;">
+            <tr>
+              <td style="padding:16px;">
+                <div style="
+                color:#90caf9;
+                font-size:11px;
+                letter-spacing:1px;
+                font-weight:600;
+                ">
+                  TIME SLOT
+                </div>
+
+                <div style="
+                color:#ffffff;
+                font-size:16px;
+                font-weight:500;
+                margin-top:6px;
+                ">
+                  ${student.slot}
+                </div>
+              </td>
+            </tr>
+          </table>
+
+          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#17335f;border-radius:16px;">
+            <tr>
+              <td style="padding:16px;">
+                <div style="
+                color:#90caf9;
+                font-size:11px;
+                letter-spacing:1px;
+                font-weight:600;
+                ">
+                  ROOM
+                </div>
+                <div style="color:#ffffff;font-size:16px;font-weight:500;margin-top:6px;">
+                  ${student.room}
+                </div>
+              </td>
+            </tr>
+          </table>
+
+        </td>
+      </tr>
+    </table>
+
+    <table
+      width="100%"
+      cellpadding="0"
+      cellspacing="0"
+      border="0"
+      style="
+      margin-top:25px;
+      background:#2a2413;
+      border:1px solid #5f4f1f;
+      border-radius:20px;
+      "
+    >
+      <tr>
+        <td style="padding:24px;">
+
+          <h3 style="
+          margin:0 0 18px 0;
+          color:#ffca28;
+          font-size:20px;
+          font-weight:600;
+          ">
+            ⚠️ Important Instructions
+          </h3>
+
+          <div style="
+          color:#ffffff;
+          line-height:1.9;
+          ">
+            <div>🕒 Report to <b>${student.room}</b> at least 15 minutes before your assigned slot.</div>
+            <div>🪪 Bring your <b>Registration ID</b>.</div>
+            <div>🔐 Keep your <b>Password</b> accessible during verification.</div>
+          </div>
+
+        </td>
+      </tr>
+    </table>
+
+    <div style="
+margin-top:30px;
+padding:28px;
+background:#152434;
+border:1px solid #29466b;
+border-radius:20px;
+text-align:center;
+">
+
+  <h3 style="
+  margin:0 0 18px 0;
+  color:#4fc3f7;
+  font-size:20px;
+  font-weight:600;
+  ">
+    QR Verification
+  </h3>
+
+  <p style="
+  color:#d6e4ff;
+  font-size:14px;
+  line-height:1.6;
+  margin:0 0 20px 0;
+  ">
+    Present this QR code during verification.
+  </p>
+
+  ${qrSection}
+
+  </div>
+
+    <div style="
+    margin-top:35px;
+    padding-top:25px;
+    border-top:1px solid #24384d;
+    text-align:center;
+    ">
+
+      <p style="
+      margin:0;
+      color:#ffffff;
+      font-size:16px;
+      ">
+        Best of luck!
+      </p>
+
+      <p style="
+      margin-top:10px;
+      color:#4fc3f7;
+      font-size:18px;
+      font-weight:600;
+      ">
+        Team MLSC
+      </p>
+
     </div>
-  `;
+    </div>
+  </div>
+`;
 }
 
-async function sendEmailWithRetry({ transporter, student, html, qrBuffer }) {
+async function ensureStudentQrToken(supabase, student) {
+  if (student.qr_token) {
+    return student;
+  }
+
+  const qrToken = crypto.randomUUID();
+  const { data, error } = await supabase
+    .from("students")
+    .update({ qr_token: qrToken })
+    .eq("id", student.id)
+    .select("id, name, branch, email, roll_number, password_hash, day, slot, room, qr_token")
+    .single();
+
+  if (error) {
+    throw new Error(`Could not create QR token for ${student.email}: ${error.message}`);
+  }
+
+  return data;
+}
+
+async function sendEmailWithRetry({
+  transporter,
+  student,
+  html,
+  qrbuffer,
+}) {
   let lastError;
 
-  for (let attempt = 1; attempt <= CONFIG.retryLimit; attempt += 1) {
+  for (let attempt = 1; attempt <= CONFIG.retryLimit; attempt++) {
     try {
       return await transporter.sendMail({
-        from: process.env.MAIL_FROM,
-        to: student.email,
-        subject: "Your Student Portal Login Details",
-        html,
-        attachments: [
-          {
-            filename: "login-qr.png",
-            content: qrBuffer,
-            contentType: "image/png",
-          },
-        ],
-      });
+  from: process.env.MAIL_FROM,
+  to: student.email,
+  subject: "MLSC Recruitment Quiz Slot Assigned",
+  html,
+
+  attachments: [
+    {
+      filename: "qr.png",
+      content: qrbuffer,
+      cid: "student-qr",
+      disposition: "inline",
+    },
+  ],
+});
     } catch (error) {
       lastError = error;
-      console.warn(
-        `Email attempt ${attempt} failed for ${student.email}: ${error.message}`
-      );
 
       if (attempt < CONFIG.retryLimit) {
         await delay(CONFIG.retryDelayMs);
@@ -271,6 +662,7 @@ async function sendEmailWithRetry({ transporter, student, html, qrBuffer }) {
 
   throw lastError;
 }
+
 
 async function updateStudentPassword(supabase, student) {
   const passwordHash = await bcrypt.hash(student.plainPassword, 12);
