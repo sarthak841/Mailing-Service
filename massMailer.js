@@ -43,7 +43,6 @@ function validateEnvironment() {
     "SMTP_USER",
     "SMTP_PASS",
     "MAIL_FROM",
-    "PORTAL_URL",
     "SCANNER_URL",
   ];
 
@@ -70,7 +69,7 @@ function createSupabaseClient() {
 async function fetchStudents(supabase) {
   const { data, error } = await supabase
     .from("students")
-    .select("id, name, branch, email, roll_number, password_hash, day, slot, room, qr_token")
+    .select("id, full_name, branch, email, admission_number, password_hash, slot_id, slots(day, slot, room), qr_token")
     .eq("is_active", true)
     .order("id", { ascending: true });
 
@@ -80,6 +79,9 @@ async function fetchStudents(supabase) {
 
   return data.map((student) => ({
     ...student,
+    day: student.slots?.day,
+    slot: student.slots?.slot,
+    room: student.slots?.room,
     plainPassword: generatePassword(CONFIG.passwordLength),
   }));
 }
@@ -171,7 +173,7 @@ async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
 
         sentLog.set(studentWithQrToken.id, {
           id: studentWithQrToken.id,
-          name: studentWithQrToken.name,
+          full_name: studentWithQrToken.full_name,
           email: studentWithQrToken.email,
           status: "Yes",
         });
@@ -184,7 +186,7 @@ async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
         console.error(`Failed for ${student.email}: ${error.message}`);
         sentLog.set(student.id, {
         id: student.id,
-        name: student.name,
+        full_name: student.full_name,
         email: student.email,
         status: "No",
       });
@@ -290,7 +292,7 @@ box-sizing:border-box;
     color:#ffffff;
     margin-top:0;
     ">
-      Dear <b>${student.name}</b>,
+      Dear <b>${student.full_name}</b>,
     </p>
 
     <p style="
@@ -350,7 +352,7 @@ box-sizing:border-box;
               padding:10px 0;
               color:#ffffff;
               ">
-                ${student.name}
+                ${student.full_name}
               </td>
             </tr>
 
@@ -359,14 +361,14 @@ box-sizing:border-box;
               padding:12px 0;
               color:#90caf9;
               ">
-                Roll Number
+                Admission Number
               </td>
 
               <td style="
               padding:10px 0;
               color:#ffffff;
               ">
-                ${student.roll_number}
+                ${student.admission_number}
               </td>
             </tr>
 
@@ -613,18 +615,22 @@ async function ensureStudentQrToken(supabase, student) {
 
   const qrToken = crypto.randomUUID();
   const { data, error } = await supabase
-    .from("students")
+    .from("candidate_profiles")
     .update({ qr_token: qrToken })
     .eq("id", student.id)
-    .select("id, name, branch, email, roll_number, password_hash, day, slot, room, qr_token")
+    .select("id, full_name, branch, email, admission_number, password_hash, slots(day, slot, room), qr_token")
     .single();
 
   if (error) {
     throw new Error(`Could not create QR token for ${student.email}: ${error.message}`);
   }
 
-  return data;
-}
+  return {
+    ...data,
+    day: data.slots?.day,
+    slot: data.slots?.slot,
+    room: data.slots?.room,
+  };
 
 async function sendEmailWithRetry({
   transporter,
@@ -668,7 +674,7 @@ async function updateStudentPassword(supabase, student) {
   const passwordHash = await bcrypt.hash(student.plainPassword, 12);
 
   const { error } = await supabase
-    .from("students")
+    .from("candidate_profiles")
     .update({
       password_hash: passwordHash,
       password_updated_at: new Date().toISOString(),
