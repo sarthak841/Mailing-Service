@@ -2,11 +2,9 @@ require("dotenv").config();
 
 const fs = require("fs/promises");
 const path = require("path");
-const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const QRCode = require("qrcode");
-const bcrypt = require("bcryptjs");
-const { createClient } = require("@supabase/supabase-js");
+const { createClient } = require("@libsql/client");
 
 const SENT_LOG_PATH = path.join(__dirname, "sent-log.json");
 
@@ -15,97 +13,74 @@ const CONFIG = {
   batchDelayMs: Number(process.env.BATCH_DELAY_MS || 30000),
   retryLimit: Number(process.env.EMAIL_RETRY_LIMIT || 3),
   retryDelayMs: Number(process.env.EMAIL_RETRY_DELAY_MS || 5000),
-  passwordLength: Number(process.env.PASSWORD_LENGTH || 10),
 };
 
-async function sendEmails() {
-  validateEnvironment();
+// ── Turso client ───────────────────────────────────────────────────────────────
 
-  const supabase = createSupabaseClient();
-  const students = await fetchStudents(supabase);
-  const sentLog = await loadSentLog();
-  const transporter = createTransport();
-
-  await sendEmailBatch({
-    supabase,
-    students,
-    sentLog,
-    transporter,
+function createDb() {
+  if (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN) {
+    throw new Error("Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN");
+  }
+  return createClient({
+    url: process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
   });
 }
 
+// ── Env validation ─────────────────────────────────────────────────────────────
+
 function validateEnvironment() {
   const required = [
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_ROLE_KEY",
+    "TURSO_DATABASE_URL",
+    "TURSO_AUTH_TOKEN",
     "SMTP_HOST",
     "SMTP_PORT",
     "SMTP_USER",
     "SMTP_PASS",
     "MAIL_FROM",
-    "SCANNER_URL",
   ];
-
   const missing = required.filter((key) => !process.env[key]);
-
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
   }
 }
 
-function createSupabaseClient() {
-  return createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-      },
-    }
-  );
+// ── Fetch candidates from Turso ────────────────────────────────────────────────
+// Joins all 4 tables to get everything needed for the email in one query.
+
+async function fetchCandidates(db) {
+  const result = await db.execute(`
+    SELECT
+      cp.id,
+      cp.full_name,
+      cp.email,
+      cp.application_number,
+      cp.date_of_birth,
+      cf.primary_department,
+      cf.secondary_department,
+      cs.application_status,
+      cs.slot_id,
+      cq.qr_token,
+      s.slot_day,
+      s.slot_number,
+      s.slot_venue,
+      sdd.slot_date,
+      sts.start_time
+    FROM candidate_profiles cp
+    LEFT JOIN candidate_form   cf  ON cf.candidate_id  = cp.id
+    LEFT JOIN candidate_status cs  ON cs.candidate_id  = cp.id
+    LEFT JOIN candidate_quiz   cq  ON cq.candidate_id  = cp.id
+    LEFT JOIN slots            s   ON s.id             = cs.slot_id
+    LEFT JOIN slot_day_dates   sdd ON sdd.day_number   = s.slot_day
+    LEFT JOIN slot_time_schedules sts ON sts.slot_number = s.slot_number
+    WHERE cs.application_status = 'Shortlisted'
+    ORDER BY cp.id ASC
+  `);
+
+  return result.rows;
 }
 
-async function fetchStudents(supabase) {
-  const { data, error } = await supabase
-    .from("students")
-    .select("id, full_name, branch, email, admission_number, password_hash, slot_id, slots(day, slot, room), qr_token")
-    .eq("is_active", true)
-    .order("id", { ascending: true });
-
-  if (error) {
-    throw new Error(`Could not fetch students: ${error.message}`);
-  }
-
-  return data.map((student) => ({
-    ...student,
-    day: student.slots?.day,
-    slot: student.slots?.slot,
-    room: student.slots?.room,
-    plainPassword: generatePassword(CONFIG.passwordLength),
-  }));
-}
-
-function generatePassword(length = 10) {
-  const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-  const lower = "abcdefghijkmnopqrstuvwxyz";
-  const digits = "23456789";
-  const symbols = "@#$%";
-  const all = upper + lower + digits + symbols;
-
-  const requiredChars = [
-    randomChar(upper),
-    randomChar(lower),
-    randomChar(digits),
-    randomChar(symbols),
-  ];
-
-  while (requiredChars.length < length) {
-    requiredChars.push(randomChar(all));
-  }
-
-  return shuffle(requiredChars).join("");
-}
+// ── Sent log ───────────────────────────────────────────────────────────────────
 
 async function loadSentLog() {
   try {
@@ -115,18 +90,21 @@ async function loadSentLog() {
         if (typeof entry === "object" && entry !== null) {
           return [entry.id, entry];
         }
-
         return [entry, { id: entry }];
       })
     );
   } catch (error) {
-    if (error.code === "ENOENT") {
-      return new Map();
-    }
-
+    if (error.code === "ENOENT") return new Map();
     throw error;
   }
 }
+
+async function saveSentLog(sentLog) {
+  const entries = [...sentLog.values()];
+  await fs.writeFile(SENT_LOG_PATH, JSON.stringify(entries, null, 2));
+}
+
+// ── Transport ──────────────────────────────────────────────────────────────────
 
 function createTransport() {
   return nodemailer.createTransport({
@@ -140,579 +118,269 @@ function createTransport() {
   });
 }
 
-async function sendEmailBatch({ supabase, students, sentLog, transporter }) {
-  let sent = 0;
-  let failed = 0;
-  let skipped = 0;
+// ── QR code ────────────────────────────────────────────────────────────────────
+// Uses the qr_token already stored in candidate_quiz — same token the portal
+// uses for QR scanning, so attendance is correctly linked.
 
-  for (let index = 0; index < students.length; index += CONFIG.batchSize) {
-    const batch = students.slice(index, index + CONFIG.batchSize);
-
-    for (const student of batch) {
-      const logEntry = sentLog.get(student.id);
-
-      if (logEntry?.status === "Yes") {
-        skipped += 1;
-        console.log(`Skipping ${student.email}; already sent.`);
-        continue;
-      }
-
-      try {
-              const studentWithQrToken = await ensureStudentQrToken(supabase, student);
-              const qrbuffer = await generateQRBuffer(studentWithQrToken);
-              const html = generateEmailHTML(studentWithQrToken);
-
-          await sendEmailWithRetry({
-            transporter,
-            student: studentWithQrToken,
-            html,
-            qrbuffer,
-          });
-
-        await updateStudentPassword(supabase, studentWithQrToken);
-
-        sentLog.set(studentWithQrToken.id, {
-          id: studentWithQrToken.id,
-          full_name: studentWithQrToken.full_name,
-          email: studentWithQrToken.email,
-          status: "Yes",
-        });
-        await saveSentLog(sentLog);
-
-        sent += 1;
-        console.log(`Sent login email to ${studentWithQrToken.email}`);
-      } catch (error) {
-        failed += 1;
-        console.error(`Failed for ${student.email}: ${error.message}`);
-        sentLog.set(student.id, {
-        id: student.id,
-        full_name: student.full_name,
-        email: student.email,
-        status: "No",
-      });
-
-await saveSentLog(sentLog);
-      }
-    }
-
-    const hasMoreBatches = index + CONFIG.batchSize < students.length;
-    if (hasMoreBatches) {
-      await delay(CONFIG.batchDelayMs);
-    }
-  }
-
-  console.log("Email summary");
-  console.log(`Sent: ${sent}`);
-  console.log(`Failed: ${failed}`);
-  console.log(`Skipped: ${skipped}`);
-  console.log(`Total processed: ${sent + failed + skipped}`);
+async function generateQRBuffer(qrToken) {
+  // Encode the raw token — admin scanner reads it directly
+  return QRCode.toBuffer(qrToken, { margin: 2, width: 240 });
 }
 
-async function generateQRBuffer(student) {
-  const scannerUrl = new URL(process.env.SCANNER_URL);
-  scannerUrl.searchParams.set("qr_token", student.qr_token);
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-  return QRCode.toBuffer(scannerUrl.toString(), {
-    margin: 2,
-    width: 240,
+function formatSlotDate(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toLocaleDateString("en-IN", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
   });
 }
 
-function generateEmailHTML(student, qrDataUrl) {
-
-  const qrSection = `
-  <img
-    src="cid:student-qr"
-    alt="QR Code"
-    style="
-      display:block;
-      width:100%;
-      max-width:200px;
-      height:auto;
-      margin:0 auto;
-      background:#ffffff;
-      padding:10px;
-      border-radius:12px;
-      box-sizing:border-box;
-    "
-  />
-`;
-
-  return `
-<div style="
-font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
-width:100%;
-max-width:700px;
-margin:0 auto;
-background:#0F1924;
-color:#f5f6fa;
-border-radius:24px;
-overflow:hidden;
-box-sizing:border-box;
-">
-
-  <div style="
-  background:#173a7a;
-  background-image:linear-gradient(135deg,#0d2650 0%,#173a7a 100%);
-  padding:35px 25px;
-  text-align:center;
-  ">
-
-    <img
-      src="https://res.cloudinary.com/dljpfochn/image/upload/v1745520987/mlsclogo_wbhck3.png"
-      alt="MLSC Logo"
-      height="95"
-      style="display:block;margin:0 auto 15px auto;border:0;"
-    >
-
-    <h1 style="
-    margin:0;
-    font-size:32px;
-    color:#ffffff;
-    font-weight:700;
-    ">
-      Quiz Slot Assigned
-    </h1>
-
-    <p style="
-    margin:10px 0 0 0;
-    color:#b9d3ff;
-    font-size:15px;
-    ">
-      Microsoft Learn Student Chapter • TIET
-    </p>
-
-  </div>
-
-  <div style="padding:30px;">
-
-    <p style="
-    font-size:16px;
-    line-height:1.7;
-    color:#ffffff;
-    margin-top:0;
-    ">
-      Dear <b>${student.full_name}</b>,
-    </p>
-
-    <p style="
-    font-size:15px;
-    line-height:1.7;
-    color:#d6e4ff;
-    ">
-      Congratulations! Your recruitment quiz slot for the
-      <b>Microsoft Learn Student Chapter (MLSC)</b>
-      has been scheduled. Please review the details below and ensure that you are available during your assigned slot.
-    </p>
-
-    <table
-      width="100%"
-      cellpadding="0"
-      cellspacing="0"
-      border="0"
-      style="
-      margin-top:25px;
-      background:#152434;
-      border:1px solid #29466b;
-      border-radius:20px;
-      "
-    >
-      <tr>
-        <td style="padding:24px;">
-
-          <h3 style="
-          margin:0 0 18px 0;
-          color:#90caf9;
-          font-size:20px;
-          font-weight:600;
-          ">
-            👤 Registration Details
-          </h3>
-
-          <table
-            width="100%"
-            cellpadding="0"
-            cellspacing="0"
-            border="0"
-            style="color:#ffffff;"
-          >
-
-            <tr>
-              <td style="
-              padding:10px 0;
-              color:#90caf9;
-              width:180px;
-              font-weight:600;
-              vertical-align:top;
-              ">
-                Student Name
-              </td>
-
-              <td style="
-              padding:10px 0;
-              color:#ffffff;
-              ">
-                ${student.full_name}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="
-              padding:12px 0;
-              color:#90caf9;
-              ">
-                Admission Number
-              </td>
-
-              <td style="
-              padding:10px 0;
-              color:#ffffff;
-              ">
-                ${student.admission_number}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="
-              padding:12px 0;
-              color:#90caf9;
-              ">
-                Branch
-              </td>
-
-              <td style="
-              padding:10px 0;
-              color:#ffffff;
-              ">
-                ${student.branch}
-              </td>
-            </tr>
-
-            <tr>
-              <td style="
-              padding:12px 0;
-              color:#90caf9;
-              ">
-                Access Password
-              </td>
-
-              <td style="padding:12px 0;">
-                <span style="
-              font-family:monospace;
-              font-weight:600;
-              font-size:15px;
-              color:#ff8d8d;
-              letter-spacing:0.5px;
-              text-transform:none;
-              ">
-                ${student.plainPassword}
-              </span>
-              </td>
-            </tr>
-
-          </table>
-
-        </td>
-      </tr>
-    </table>
-
-    <table
-      width="100%"
-      cellpadding="0"
-      cellspacing="0"
-      border="0"
-      style="
-      margin-top:25px;
-      background:#12263f;
-      border:1px solid #204b7d;
-      border-radius:20px;
-      "
-    >
-      <tr>
-        <td style="padding:24px;">
-
-          <h3 style="
-          margin:0 0 18px 0;
-          color:#4fc3f7;
-          font-size:20px;
-          font-weight:600;
-          ">
-            📅 Exam Schedule
-          </h3>
-
-          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#17335f;border-radius:16px;margin-bottom:12px;">
-            <tr>
-              <td style="padding:16px;">
-                <div style="
-                color:#90caf9;
-                font-size:11px;
-                letter-spacing:1px;
-                font-weight:600;
-                ">
-                DAY
-                </div>
-
-                <div style="
-                color:#ffffff;
-                font-size:16px;
-                font-weight:500;
-                margin-top:6px;
-                ">
-                  Day ${student.day}
-                </div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#17335f;border-radius:16px;margin-bottom:12px;">
-            <tr>
-              <td style="padding:16px;">
-                <div style="
-                color:#90caf9;
-                font-size:11px;
-                letter-spacing:1px;
-                font-weight:600;
-                ">
-                  TIME SLOT
-                </div>
-
-                <div style="
-                color:#ffffff;
-                font-size:16px;
-                font-weight:500;
-                margin-top:6px;
-                ">
-                  ${student.slot}
-                </div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#17335f;border-radius:16px;">
-            <tr>
-              <td style="padding:16px;">
-                <div style="
-                color:#90caf9;
-                font-size:11px;
-                letter-spacing:1px;
-                font-weight:600;
-                ">
-                  ROOM
-                </div>
-                <div style="color:#ffffff;font-size:16px;font-weight:500;margin-top:6px;">
-                  ${student.room}
-                </div>
-              </td>
-            </tr>
-          </table>
-
-        </td>
-      </tr>
-    </table>
-
-    <table
-      width="100%"
-      cellpadding="0"
-      cellspacing="0"
-      border="0"
-      style="
-      margin-top:25px;
-      background:#2a2413;
-      border:1px solid #5f4f1f;
-      border-radius:20px;
-      "
-    >
-      <tr>
-        <td style="padding:24px;">
-
-          <h3 style="
-          margin:0 0 18px 0;
-          color:#ffca28;
-          font-size:20px;
-          font-weight:600;
-          ">
-            ⚠️ Important Instructions
-          </h3>
-
-          <div style="
-          color:#ffffff;
-          line-height:1.9;
-          ">
-            <div>🕒 Report to <b>${student.room}</b> at least 15 minutes before your assigned slot.</div>
-            <div>🪪 Bring your <b>Registration ID</b>.</div>
-            <div>🔐 Keep your <b>Password</b> accessible during verification.</div>
-          </div>
-
-        </td>
-      </tr>
-    </table>
-
-    <div style="
-margin-top:30px;
-padding:28px;
-background:#152434;
-border:1px solid #29466b;
-border-radius:20px;
-text-align:center;
-">
-
-  <h3 style="
-  margin:0 0 18px 0;
-  color:#4fc3f7;
-  font-size:20px;
-  font-weight:600;
-  ">
-    QR Verification
-  </h3>
-
-  <p style="
-  color:#d6e4ff;
-  font-size:14px;
-  line-height:1.6;
-  margin:0 0 20px 0;
-  ">
-    Present this QR code during verification.
-  </p>
-
-  ${qrSection}
-
-  </div>
-
-    <div style="
-    margin-top:35px;
-    padding-top:25px;
-    border-top:1px solid #24384d;
-    text-align:center;
-    ">
-
-      <p style="
-      margin:0;
-      color:#ffffff;
-      font-size:16px;
-      ">
-        Best of luck!
-      </p>
-
-      <p style="
-      margin-top:10px;
-      color:#4fc3f7;
-      font-size:18px;
-      font-weight:600;
-      ">
-        Team MLSC
-      </p>
-
-    </div>
-    </div>
-  </div>
-`;
+function formatSlotTime(timeStr) {
+  if (!timeStr) return null;
+  const [hh, mm] = timeStr.split(":");
+  const h = Number(hh);
+  const ampm = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 || 12;
+  return `${h12}:${mm} ${ampm}`;
 }
 
-async function ensureStudentQrToken(supabase, student) {
-  if (student.qr_token) {
-    return student;
-  }
-
-  const qrToken = crypto.randomUUID();
-  const { data, error } = await supabase
-    .from("candidate_profiles")
-    .update({ qr_token: qrToken })
-    .eq("id", student.id)
-    .select("id, full_name, branch, email, admission_number, password_hash, slots(day, slot, room), qr_token")
-    .single();
-
-  if (error) {
-    throw new Error(`Could not create QR token for ${student.email}: ${error.message}`);
-  }
-
-  return {
-    ...data,
-    day: data.slots?.day,
-    slot: data.slots?.slot,
-    room: data.slots?.room,
-  };
-
-async function sendEmailWithRetry({
-  transporter,
-  student,
-  html,
-  qrbuffer,
-}) {
-  let lastError;
-
-  for (let attempt = 1; attempt <= CONFIG.retryLimit; attempt++) {
-    try {
-      return await transporter.sendMail({
-  from: process.env.MAIL_FROM,
-  to: student.email,
-  subject: "MLSC Recruitment Quiz Slot Assigned",
-  html,
-
-  attachments: [
-    {
-      filename: "qr.png",
-      content: qrbuffer,
-      cid: "student-qr",
-      disposition: "inline",
-    },
-  ],
-});
-    } catch (error) {
-      lastError = error;
-
-      if (attempt < CONFIG.retryLimit) {
-        await delay(CONFIG.retryDelayMs);
-      }
-    }
-  }
-
-  throw lastError;
-}
-
-
-async function updateStudentPassword(supabase, student) {
-  const passwordHash = await bcrypt.hash(student.plainPassword, 12);
-
-  const { error } = await supabase
-    .from("candidate_profiles")
-    .update({
-      password_hash: passwordHash,
-      password_updated_at: new Date().toISOString(),
-    })
-    .eq("id", student.id);
-
-  if (error) {
-    throw new Error(`Could not update password for ${student.email}: ${error.message}`);
-  }
-}
-
-async function saveSentLog(sentLog) {
-  const sentEntries = [...sentLog.values()];
-  await fs.writeFile(SENT_LOG_PATH, JSON.stringify(sentEntries, null, 2));
+function escapeHTML(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function randomChar(source) {
-  return source[Math.floor(Math.random() * source.length)];
+// ── Email HTML ─────────────────────────────────────────────────────────────────
+
+function generateEmailHTML(candidate) {
+  const dateLabel = formatSlotDate(candidate.slot_date) ?? "To be announced";
+  const timeLabel = formatSlotTime(candidate.start_time) ?? "To be announced";
+  const venueLabel = escapeHTML(candidate.slot_venue ?? "To be announced");
+  const dayLabel = candidate.slot_day ? `Day ${candidate.slot_day}` : "To be announced";
+  const slotLabel = candidate.slot_number ? `Slot ${candidate.slot_number}` : "To be announced";
+
+  return `
+<div style="font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;width:100%;max-width:600px;margin:0 auto;background:#0F1924;color:#f5f6fa;border-radius:16px;overflow:hidden;box-sizing:border-box;">
+
+  <div style="background:linear-gradient(135deg,#0d2650 0%,#173a7a 100%);padding:28px 20px;text-align:center;">
+    <img src="https://res.cloudinary.com/dljpfochn/image/upload/v1745520987/mlsclogo_wbhck3.png" alt="MLSC Logo" height="80" style="display:block;margin:0 auto 12px auto;border:0;">
+    <h1 style="margin:0;font-size:24px;color:#ffffff;font-weight:700;">Quiz Slot Assigned</h1>
+    <p style="margin:8px 0 0 0;color:#b9d3ff;font-size:13px;">Microsoft Learn Student Chapter • TIET</p>
+  </div>
+
+  <div style="padding:24px 20px;">
+
+    <p style="font-size:15px;line-height:1.7;color:#ffffff;margin-top:0;">
+      Dear <b>${escapeHTML(candidate.full_name)}</b>,
+    </p>
+    <p style="font-size:14px;line-height:1.7;color:#d6e4ff;margin-bottom:20px;">
+      Congratulations! Your recruitment quiz slot for the <b>Microsoft Learn Student Chapter (MLSC)</b> has been scheduled. Please review the details below.
+    </p>
+
+    <!-- Registration Details -->
+    <div style="background:#152434;border:1px solid #29466b;border-radius:14px;padding:20px;margin-bottom:16px;">
+      <h3 style="margin:0 0 14px 0;color:#90caf9;font-size:16px;font-weight:600;">👤 Registration Details</h3>
+      <table width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td style="padding:8px 0;color:#90caf9;font-size:13px;font-weight:600;width:140px;vertical-align:top;">Student Name</td>
+          <td style="padding:8px 0;color:#ffffff;font-size:13px;">${escapeHTML(candidate.full_name)}</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 0;color:#90caf9;font-size:13px;font-weight:600;vertical-align:top;">Application No.</td>
+          <td style="padding:8px 0;color:#ffffff;font-size:13px;">${escapeHTML(candidate.application_number)}</td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Exam Schedule -->
+    <div style="background:#12263f;border:1px solid #204b7d;border-radius:14px;padding:20px;margin-bottom:16px;">
+      <h3 style="margin:0 0 14px 0;color:#4fc3f7;font-size:16px;font-weight:600;">📅 Exam Schedule</h3>
+
+      <div style="background:#17335f;border-radius:10px;padding:12px 16px;margin-bottom:10px;">
+        <div style="color:#90caf9;font-size:10px;letter-spacing:1px;font-weight:600;text-transform:uppercase;">Day</div>
+        <div style="color:#ffffff;font-size:15px;font-weight:500;margin-top:4px;">${escapeHTML(dayLabel)}</div>
+      </div>
+
+      <div style="background:#17335f;border-radius:10px;padding:12px 16px;margin-bottom:10px;">
+        <div style="color:#90caf9;font-size:10px;letter-spacing:1px;font-weight:600;text-transform:uppercase;">Date</div>
+        <div style="color:#ffffff;font-size:15px;font-weight:500;margin-top:4px;">${escapeHTML(dateLabel)}</div>
+      </div>
+
+      <div style="background:#17335f;border-radius:10px;padding:12px 16px;margin-bottom:10px;">
+        <div style="color:#90caf9;font-size:10px;letter-spacing:1px;font-weight:600;text-transform:uppercase;">Time Slot</div>
+        <div style="color:#ffffff;font-size:15px;font-weight:500;margin-top:4px;">${escapeHTML(slotLabel)} — ${escapeHTML(timeLabel)}</div>
+      </div>
+
+      <div style="background:#17335f;border-radius:10px;padding:12px 16px;">
+        <div style="color:#90caf9;font-size:10px;letter-spacing:1px;font-weight:600;text-transform:uppercase;">Venue</div>
+        <div style="color:#ffffff;font-size:15px;font-weight:500;margin-top:4px;">${venueLabel}</div>
+      </div>
+    </div>
+
+    <!-- Instructions -->
+    <div style="background:#2a2413;border:1px solid #5f4f1f;border-radius:14px;padding:20px;margin-bottom:16px;">
+      <h3 style="margin:0 0 12px 0;color:#ffca28;font-size:16px;font-weight:600;">⚠️ Important Instructions</h3>
+      <div style="color:#ffffff;font-size:13px;line-height:1.9;">
+        <div>🕒 Report to <b>${venueLabel}</b> at least 15 minutes before your slot.</div>
+        <div>🪪 Bring your <b>College ID Card</b>.</div>
+        <div>📱 Keep this email accessible — you'll need the QR code below for attendance.</div>
+      </div>
+    </div>
+
+    <!-- QR Code -->
+    <div style="background:#152434;border:1px solid #29466b;border-radius:14px;padding:20px;text-align:center;">
+      <h3 style="margin:0 0 10px 0;color:#4fc3f7;font-size:16px;font-weight:600;">QR Verification</h3>
+      <p style="color:#d6e4ff;font-size:13px;line-height:1.6;margin:0 0 16px 0;">
+        Present this QR code at the venue to mark your attendance.
+      </p>
+      <img
+        src="cid:student-qr"
+        alt="QR Code"
+        width="180"
+        height="180"
+        style="display:block;margin:0 auto;background:#ffffff;padding:8px;border-radius:10px;"
+      />
+    </div>
+
+    <!-- Footer -->
+    <div style="margin-top:28px;padding-top:20px;border-top:1px solid #24384d;text-align:center;">
+      <p style="margin:0;color:#ffffff;font-size:15px;">Best of luck!</p>
+      <p style="margin-top:8px;color:#4fc3f7;font-size:16px;font-weight:600;">Team MLSC</p>
+    </div>
+
+  </div>
+</div>
+`;
 }
 
-function shuffle(items) {
-  return items
-    .map((value) => ({ value, sort: Math.random() }))
-    .sort((a, b) => a.sort - b.sort)
-    .map(({ value }) => value);
+
+// ── Send with retry ────────────────────────────────────────────────────────────
+
+async function sendEmailWithRetry({ transporter, candidate, html, qrBuffer }) {
+  let lastError;
+  for (let attempt = 1; attempt <= CONFIG.retryLimit; attempt++) {
+    try {
+      return await transporter.sendMail({
+        from: process.env.MAIL_FROM,
+        to: candidate.email,
+        subject: "MLSC Recruitment Quiz Slot Assigned",
+        html,
+        attachments: [
+          {
+            filename: "qr.png",
+            content: qrBuffer,
+            cid: "student-qr",
+            disposition: "inline",
+          },
+        ],
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt < CONFIG.retryLimit) await delay(CONFIG.retryDelayMs);
+    }
+  }
+  throw lastError;
 }
 
-function escapeHTML(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+// ── Main batch sender ──────────────────────────────────────────────────────────
+
+async function sendEmailBatch({ candidates, sentLog, transporter }) {
+  let sent = 0;
+  let failed = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < candidates.length; i += CONFIG.batchSize) {
+    const batch = candidates.slice(i, i + CONFIG.batchSize);
+
+    for (const candidate of batch) {
+      const logEntry = sentLog.get(candidate.id);
+
+      if (logEntry?.status === "Yes") {
+        skipped += 1;
+        console.log(`Skipping ${candidate.email} — already sent.`);
+        continue;
+      }
+
+      // Skip candidates with no slot assigned yet
+      if (!candidate.slot_id) {
+        console.log(`Skipping ${candidate.email} — no slot assigned.`);
+        skipped += 1;
+        continue;
+      }
+
+      // Skip candidates with no qr_token
+      if (!candidate.qr_token) {
+        console.log(`Skipping ${candidate.email} — no QR token.`);
+        skipped += 1;
+        continue;
+      }
+
+      try {
+        const qrBuffer = await generateQRBuffer(candidate.qr_token);
+        const html = generateEmailHTML(candidate);
+
+        await sendEmailWithRetry({ transporter, candidate, html, qrBuffer });
+
+        sentLog.set(candidate.id, {
+          id: candidate.id,
+          full_name: candidate.full_name,
+          email: candidate.email,
+          status: "Yes",
+        });
+        await saveSentLog(sentLog);
+
+        sent += 1;
+        console.log(`✓ Sent to ${candidate.email}`);
+      } catch (error) {
+        failed += 1;
+        console.error(`✗ Failed for ${candidate.email}: ${error.message}`);
+        sentLog.set(candidate.id, {
+          id: candidate.id,
+          full_name: candidate.full_name,
+          email: candidate.email,
+          status: "No",
+        });
+        await saveSentLog(sentLog);
+      }
+    }
+
+    const hasMoreBatches = i + CONFIG.batchSize < candidates.length;
+    if (hasMoreBatches) {
+      console.log(`Batch done. Waiting ${CONFIG.batchDelayMs / 1000}s before next batch…`);
+      await delay(CONFIG.batchDelayMs);
+    }
+  }
+
+  console.log("\n── Email Summary ──────────────────────");
+  console.log(`Sent:    ${sent}`);
+  console.log(`Failed:  ${failed}`);
+  console.log(`Skipped: ${skipped}`);
+  console.log(`Total:   ${sent + failed + skipped}`);
+  console.log("───────────────────────────────────────");
+}
+
+// ── Entry point ────────────────────────────────────────────────────────────────
+
+async function sendEmails() {
+  validateEnvironment();
+
+  const db = createDb();
+  const candidates = await fetchCandidates(db);
+  console.log(`Fetched ${candidates.length} candidates from Turso.`);
+
+  const sentLog = await loadSentLog();
+  const transporter = createTransport();
+
+  await sendEmailBatch({ candidates, sentLog, transporter });
 }
 
 sendEmails().catch((error) => {
